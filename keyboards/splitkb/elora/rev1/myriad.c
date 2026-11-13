@@ -8,6 +8,37 @@
 #include "i2c_master.h"
 #include "analog.h"
 
+#ifdef TRACKBALL_ON_RIGHT
+#    include "drivers/sensors/pmw3320.h"
+
+static bool trackball_ready = false;
+
+// With no sensor attached the SDIO line floats high, so every register reads
+// 0xFF and the driver reports a constant (-1, -1) motion. Probe the product-ID
+// register occasionally and only give up after several consecutive all-ones
+// reads, so a brief glitch on a healthy sensor can never disable it.
+static uint8_t  trackball_invalid_reads = 0;
+static uint32_t trackball_probe_timer   = 0;
+
+// Current sensitivity, tracked here so that sniper mode can restore it. The
+// custom driver's get/set_cpi are weak no-ops by default, so override them to
+// make pointing_device_set_cpi_on_side() reach the sensor.
+static uint16_t trackball_cpi = PMW3320_CPI;
+
+uint16_t pointing_device_driver_get_cpi(void) {
+    return trackball_cpi;
+}
+
+void pointing_device_driver_set_cpi(uint16_t cpi) {
+    trackball_cpi = cpi;
+    // Only the half the trackball is wired to should talk to it; on the left
+    // half these pins belong to the joystick.
+    if (!is_keyboard_left() && trackball_ready) {
+        pmw3320_set_cpi(cpi);
+    }
+}
+#endif
+
 typedef struct __attribute__((__packed__)) {
     char magic_numbers[3];
     uint8_t version_major;
@@ -270,6 +301,34 @@ uint8_t myriad_hook_encoder(uint8_t index, bool pad_b) {
 }
 
 report_mouse_t pointing_device_driver_get_report(report_mouse_t mouse_report) {
+#ifdef TRACKBALL_ON_RIGHT
+    // Right half: the PMW3320 trackball drives the cursor.
+    if (!is_keyboard_left()) {
+        if (!trackball_ready) {
+            return mouse_report;
+        }
+        // Detect an absent sensor so a floating SDIO line cannot report a
+        // constant motion. A real sensor never returns 0xFF for both the
+        // product ID and its inverse (they are complements), so a working
+        // sensor can never be disabled by this check.
+        if (timer_elapsed32(trackball_probe_timer) >= 250) {
+            trackball_probe_timer = timer_read32();
+            if (pmw3320_read_reg(REG_Product_ID) == 0xFF && pmw3320_read_reg(REG_Inverse_Product_ID) == 0xFF) {
+                if (++trackball_invalid_reads >= 4) {
+                    trackball_ready = false;
+                }
+            } else {
+                trackball_invalid_reads = 0;
+            }
+            if (!trackball_ready) {
+                return mouse_report;
+            }
+        }
+        return pmw3320_get_report(mouse_report);
+    }
+#endif
+
+    // Left half: the Myriad joystick. keymap.c converts its x/y into scrolling.
     if (myriad_card_init() != SKB_JOYSTICK) { return mouse_report; }
 
     if (timer_elapsed(myr_joystick_timer) < 10) {
@@ -285,6 +344,21 @@ report_mouse_t pointing_device_driver_get_report(report_mouse_t mouse_report) {
     // Values are now -512..512
 
     // Create a dead zone in the middle where the mouse doesn't move
+#ifdef TRACKBALL_ON_RIGHT
+    // Scrolling is high resolution, so a few counts of resting offset would
+    // accumulate into a visible drift. Use a wider dead zone, and subtract it
+    // so the response still starts from zero at its edge instead of jumping.
+    if (x > -MYRIAD_SCROLL_DEADZONE && x < MYRIAD_SCROLL_DEADZONE) {
+        x = 0;
+    } else {
+        x -= (x > 0) ? MYRIAD_SCROLL_DEADZONE : -MYRIAD_SCROLL_DEADZONE;
+    }
+    if (y > -MYRIAD_SCROLL_DEADZONE && y < MYRIAD_SCROLL_DEADZONE) {
+        y = 0;
+    } else {
+        y -= (y > 0) ? MYRIAD_SCROLL_DEADZONE : -MYRIAD_SCROLL_DEADZONE;
+    }
+#else
     const int16_t dead_zone = 10;
     if ((y < 0 && y > -1*dead_zone) || (y > 0 && y < dead_zone)) {
         y = 0;
@@ -292,10 +366,19 @@ report_mouse_t pointing_device_driver_get_report(report_mouse_t mouse_report) {
     if ((x < 0 && x > -1*dead_zone) || (x > 0 && x < dead_zone)) {
         x = 0;
     }
+#endif
 
     // quadratic movement
+#ifdef TRACKBALL_ON_RIGHT
+    // The joystick now drives scrolling, so a linear response feels much more
+    // proportional: the quadratic curve below produces almost nothing until
+    // the stick is pushed a long way, then ramps up abruptly.
+    x = x / 4;
+    y = y / 4;
+#else
     x = abs(x) * x / 5000;
     y = abs(y) * y / 5000;
+#endif
 
     // Clamp final value to make sure we don't under/overflow
     if (y < -127) { y = -127; }
@@ -310,6 +393,25 @@ report_mouse_t pointing_device_driver_get_report(report_mouse_t mouse_report) {
 }
 
 void pointing_device_driver_init(void) {
+#ifdef TRACKBALL_ON_RIGHT
+    // Right half: start the PMW3320 trackball.
+    if (!is_keyboard_left()) {
+        pmw3320_init();
+        // This particular sensor's product-ID registers do not match what
+        // pmw3320_check_signature() expects, even though motion reporting
+        // works, so the check is treated as advisory.
+#ifdef PMW3320_SKIP_SIGNATURE_CHECK
+        trackball_ready = true;
+#else
+        trackball_ready = pmw3320_check_signature();
+#endif
+        if (trackball_ready) {
+            pmw3320_set_cpi(PMW3320_CPI);
+        }
+        return;
+    }
+#endif
+
     gpio_set_pin_input(MYRIAD_ADC1); // Y
     gpio_set_pin_input(MYRIAD_ADC2); // X
 }
