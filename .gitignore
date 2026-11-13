@@ -116,3 +116,7 @@ user_song_list.h
 compile_commands.json
 .clangd/
 .cache/
+
+# Vial layout exports. These contain the full layout including macro text, which
+# may hold passwords or other personal data, so keep them out of the repo.
+*.vil
